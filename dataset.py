@@ -18,6 +18,7 @@ A PyG `Data` object here carries:
 
 import argparse
 import os
+import warnings
 import h5py
 import numpy as np
 import torch
@@ -27,14 +28,82 @@ from torch_geometric.data import Data, Dataset
 # ----------------------------------------------------------------------------
 # Node / edge feature construction (shared by both loaders)
 # ----------------------------------------------------------------------------
-def build_node_features(surface_type_ids, areas, num_surface_types, centroids=None):
-    """One-hot surface type + log-norm area (+ optional centroid xyz) -> [N, D].
+def pool_facet_features_to_faces(V_2, A_3, num_faces):
+    """Aggregate per-facet mesh features up to their parent B-rep face -> [num_faces, 4].
 
-    D = num_surface_types + 1            (no centroids)
-    D = num_surface_types + 1 + 3        (with centroids)
+    Inputs (all for a SINGLE part / consistent index space):
+      V_2  : [M, 4]   per-facet mesh features. Cols 0-2 are the (min-max encoded)
+                      facet normal, col 3 is the plane offset `d`.
+      A_3  : [K, 2]   facet<->face incidence. col0 indexes rows of V_2 (a facet),
+                      col1 is the parent face id in [0, num_faces).
+      num_faces : int number of B-rep faces (rows in the output).
+
+    Output columns: [mean_normal_x, mean_normal_y, mean_normal_z, mean_d].
+
+    Audit notes (see diag/): the stored normals are NOT raw unit vectors — they are
+    per-batch min-max encoded into [0,1]. We decode with `2v-1` and L2-normalize per
+    facet so the mean operates on approximate directions, then re-normalize the mean
+    (the average of unit vectors is not itself unit length). The originally-planned
+    normal-variance/curvature channel was dropped: on this data it does not track
+    curvature (flat faces show as much or more facet-normal spread than curved ones),
+    so it would be a misleading feature rather than a flatness signal.
+
+    Faces with zero incident facets get a zero vector (and a warning) instead of NaN.
+    """
+    V_2 = np.asarray(V_2, dtype=np.float32)
+    if A_3 is None or len(A_3) == 0:
+        warnings.warn(
+            f"pool_facet_features_to_faces: no facet incidence for {num_faces} "
+            "faces; returning zero mesh features")
+        return np.zeros((num_faces, 4), dtype=np.float32)
+
+    A_3 = np.asarray(A_3)
+    facet_idx = A_3[:, 0].astype(np.int64)
+    face_idx = A_3[:, 1].astype(np.int64)
+
+    # decode [0,1] -> [-1,1] then L2-normalize each facet normal to a direction
+    n = 2.0 * V_2[facet_idx, :3] - 1.0
+    n = n / np.clip(np.linalg.norm(n, axis=1, keepdims=True), 1e-6, None)
+    d = V_2[facet_idx, 3].astype(np.float64)
+
+    sum_n = np.zeros((num_faces, 3), dtype=np.float64)
+    sum_d = np.zeros(num_faces, dtype=np.float64)
+    counts = np.zeros(num_faces, dtype=np.int64)
+    np.add.at(sum_n, face_idx, n)
+    np.add.at(sum_d, face_idx, d)
+    np.add.at(counts, face_idx, 1)
+
+    empty = counts == 0
+    if empty.any():
+        warnings.warn(
+            f"pool_facet_features_to_faces: {int(empty.sum())}/{num_faces} face(s) "
+            "have zero facets; using a zero mesh-feature vector for them")
+
+    safe = np.clip(counts, 1, None).astype(np.float64)
+    mean_n = sum_n / safe[:, None]
+    mean_d = sum_d / safe
+
+    # re-normalize the mean normal: mean of unit vectors isn't unit length
+    mean_n = mean_n / np.clip(np.linalg.norm(mean_n, axis=1, keepdims=True), 1e-6, None)
+
+    out = np.zeros((num_faces, 4), dtype=np.float32)
+    out[:, :3] = mean_n
+    out[:, 3] = mean_d
+    out[empty] = 0.0
+    return out
+
+
+def build_node_features(surface_type_ids, areas, num_surface_types, centroids=None,
+                        mesh_feats=None):
+    """One-hot surface type + log-norm area (+ optional centroid xyz, mesh feats) -> [N, D].
+
+    D = num_surface_types + 1                (no extras)
+    D = num_surface_types + 1 + 3            (with centroids)
+    D = num_surface_types + 1 + 3 + 4        (with centroids + pooled mesh feats)
     Centroids give the model a sense of *where* a face sits, which separates
-    otherwise-identical faces (e.g. two cylinders of equal type/area) — the main
-    thing the type+area-only features could not distinguish.
+    otherwise-identical faces (e.g. two cylinders of equal type/area). The 4 pooled
+    mesh features (mean facet normal xyz + mean plane offset d) add coarse orientation
+    and position-along-normal that the B-rep level alone does not expose.
     """
     n = len(surface_type_ids)
     onehot = np.zeros((n, num_surface_types), dtype=np.float32)
@@ -48,6 +117,15 @@ def build_node_features(surface_type_ids, areas, num_surface_types, centroids=No
         # center per part: absolute bbox position is arbitrary, relative layout isn't
         c = c - c.mean(axis=0, keepdims=True)
         feats.append(c)
+    if mesh_feats is not None:
+        mf = np.asarray(mesh_feats, dtype=np.float32).reshape(n, -1)
+        normals = mf[:, :3]                  # already unit-length directions
+        d = mf[:, 3:4]
+        # plane-d is raw and huge-ranged (~+/-8000): signed-log then per-part standardize
+        d = np.sign(d) * np.log1p(np.abs(d))
+        d = (d - d.mean()) / (d.std() + 1e-6)
+        feats.append(normals)
+        feats.append(d)
     return np.concatenate(feats, axis=1)
 
 
@@ -177,6 +255,7 @@ class MFCADPPGraphDataset(_H5PickleMixin, Dataset):
             cached = {
                 "idx": batch["idx"][()],
                 "A_1_idx": batch["A_1_idx"][()],
+                "A_3_idx": batch["A_3_idx"][()],
                 "E_1_idx": batch["E_1_idx"][()],
                 "E_2_idx": batch["E_2_idx"][()],
                 "E_3_idx": batch["E_3_idx"][()],
@@ -186,6 +265,26 @@ class MFCADPPGraphDataset(_H5PickleMixin, Dataset):
 
     def len(self):
         return len(self.ids)
+
+    def _pool_mesh_feats(self, batch, a3_idx, start, end, num_faces):
+        """Pool this model's facet (V_2) features up to its faces -> [num_faces, 4].
+
+        A_3_idx col1 (parent face) uses the same 0-based, batch-local face indexing
+        as `start:end`; col0 indexes V_2 rows directly. We select this model's
+        incidence rows by face range, slice only the facets we need out of V_2, and
+        rebase indices into the local [0, num_faces) / [0, num_facets) space.
+        """
+        mask = (a3_idx[:, 1] >= start) & (a3_idx[:, 1] < end)
+        if not mask.any():
+            return np.zeros((num_faces, 4), dtype=np.float32)
+        rows = a3_idx[mask]
+        facet_global = rows[:, 0]
+        face_local = rows[:, 1] - start
+        fmin = int(facet_global.min())
+        fmax = int(facet_global.max())
+        v2 = np.asarray(batch["V_2"][fmin:fmax + 1], dtype=np.float32)  # slice in HDF5
+        a3_local = np.stack([facet_global - fmin, face_local], axis=1)
+        return pool_facet_features_to_faces(v2, a3_local, num_faces)
 
     def _read_sample(self, part_id):
         self._ensure_open()
@@ -200,8 +299,10 @@ class MFCADPPGraphDataset(_H5PickleMixin, Dataset):
                                  0, self.num_surface_types - 1)
         areas = v1[:, 0]
         centroids = v1[:, 1:4]   # normalized centroid x/y/z (unused before)
+        num_faces = end - start
+        mesh_feats = self._pool_mesh_feats(batch, arrs["A_3_idx"], start, end, num_faces)
         x = build_node_features(surface_type_ids, areas, self.num_surface_types,
-                                centroids=centroids)
+                                centroids=centroids, mesh_feats=mesh_feats)
 
         a1 = _edge_set(arrs["A_1_idx"], start, end)
         e1 = {_canonical_edge(u, v) for u, v in _edge_set(arrs["E_1_idx"], start, end)}
