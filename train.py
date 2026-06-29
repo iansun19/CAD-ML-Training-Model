@@ -13,19 +13,13 @@ import os
 import time
 import datetime
 import yaml
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from dataset import get_dataset
+from device import resolve_device, set_seed
 from model import BRepGNN
-
-
-def set_seed(s):
-    import random
-    random.seed(s); np.random.seed(s)
-    torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
 
 def accuracy(logits, y):
@@ -48,7 +42,7 @@ def main():
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
     set_seed(cfg["seed"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(cfg.get("device", "auto"))
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out = os.path.join(cfg["out_dir"], stamp)
@@ -69,7 +63,8 @@ def main():
     log(f"sizes train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
 
     train_ld = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
-                          num_workers=cfg["num_workers"], pin_memory=True)
+                          num_workers=cfg["num_workers"],
+                          pin_memory=(device.type == "cuda"))
     val_ld = DataLoader(val_ds, batch_size=cfg["batch_size"],
                         num_workers=cfg["num_workers"])
     test_ld = DataLoader(test_ds, batch_size=cfg["batch_size"],
@@ -117,7 +112,8 @@ def main():
                 break
 
     # final test with best weights
-    model.load_state_dict(torch.load(os.path.join(out, "best_model.pt")))
+    model.load_state_dict(torch.load(os.path.join(out, "best_model.pt"),
+                                     map_location=device))
     test_acc = evaluate(model, test_ld, device)
     log(f"DONE. best_val={best_val:.4f}@{best_epoch} test_acc={test_acc:.4f}")
     logf.close()

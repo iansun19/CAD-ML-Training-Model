@@ -14,6 +14,7 @@ dropout: 0.2
 edge_dim: 5              # 3 (convex/concave/smooth one-hot) + 1 angle + 1 length
 
 # --- Training ---
+device: auto             # auto | cuda | mps | cpu
 epochs: 60               # early stopping usually halts well before this
 batch_size: 64           # graphs per batch; lower if you hit OOM
 lr: 0.001

@@ -13,13 +13,27 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from dataset import get_dataset
+from device import resolve_device
 from model import BRepGNN
+
+
+def _pyg_wheel_status():
+    parts = []
+    for name in ("torch_scatter", "torch_sparse"):
+        try:
+            __import__(name)
+            parts.append(f"{name}: installed")
+        except ImportError:
+            parts.append(f"{name}: not installed")
+    return ", ".join(parts) + " (OK — PyG fallbacks work without them)"
 
 
 def main():
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(cfg.get("device", "auto"))
+    print(f"device={device}")
+    print(f"pyg wheels: {_pyg_wheel_status()}")
 
     full = get_dataset(cfg, "train.txt")
     subset = [full[i] for i in range(min(20, len(full)))]

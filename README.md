@@ -28,6 +28,16 @@ on a single GPU.
 4. Run `python train.py` overnight.
 5. Read `runs/<timestamp>/log.txt` and `best_model.pt` in the morning.
 
+### Mac / Apple Silicon
+1. Use the **minimal Mac install** in `requirements.txt` (`torch` + `torch_geometric` only —
+   no `torch_scatter` / `torch_sparse` wheels; they often fail to build on Mac and aren't
+   required for this pipeline).
+2. Device auto-selects **MPS** when available (`config.yaml: device: auto`). The overfit
+   check prints `device=mps` at startup if it's working.
+3. Run `overfit_check.py` first — even on MPS it finishes in a few minutes on 20 parts.
+4. If overfit passes, either let the full run grind overnight on your Mac, or spin up a
+   cloud GPU for a faster clean run. Set `device: cpu` in config if you hit a rare MPS op gap.
+
 ## The one thing that will bite you
 The data loader. MFCAD++ ships BOTH STEP files AND a prebuilt hierarchical H5.
 Inspect `h5_structure.h5` first (`python dataset.py --inspect-h5 path/to/h5`) and
