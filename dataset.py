@@ -27,15 +27,28 @@ from torch_geometric.data import Data, Dataset
 # ----------------------------------------------------------------------------
 # Node / edge feature construction (shared by both loaders)
 # ----------------------------------------------------------------------------
-def build_node_features(surface_type_ids, areas, num_surface_types):
-    """One-hot surface type + log-normalized area -> [N, num_surface_types+1]."""
+def build_node_features(surface_type_ids, areas, num_surface_types, centroids=None):
+    """One-hot surface type + log-norm area (+ optional centroid xyz) -> [N, D].
+
+    D = num_surface_types + 1            (no centroids)
+    D = num_surface_types + 1 + 3        (with centroids)
+    Centroids give the model a sense of *where* a face sits, which separates
+    otherwise-identical faces (e.g. two cylinders of equal type/area) — the main
+    thing the type+area-only features could not distinguish.
+    """
     n = len(surface_type_ids)
     onehot = np.zeros((n, num_surface_types), dtype=np.float32)
     onehot[np.arange(n), np.clip(surface_type_ids, 0, num_surface_types - 1)] = 1.0
     area = np.log1p(np.asarray(areas, dtype=np.float32)).reshape(-1, 1)
     # robust per-part normalization so big parts don't dominate
     area = (area - area.mean()) / (area.std() + 1e-6)
-    return np.concatenate([onehot, area], axis=1)
+    feats = [onehot, area]
+    if centroids is not None:
+        c = np.asarray(centroids, dtype=np.float32).reshape(n, -1)
+        # center per part: absolute bbox position is arbitrary, relative layout isn't
+        c = c - c.mean(axis=0, keepdims=True)
+        feats.append(c)
+    return np.concatenate(feats, axis=1)
 
 
 def build_edge_features(convexity_ids, angles, lengths):
@@ -186,7 +199,9 @@ class MFCADPPGraphDataset(_H5PickleMixin, Dataset):
         surface_type_ids = np.clip(np.round(v1[:, 4] * 11).astype(int) - 1,
                                  0, self.num_surface_types - 1)
         areas = v1[:, 0]
-        x = build_node_features(surface_type_ids, areas, self.num_surface_types)
+        centroids = v1[:, 1:4]   # normalized centroid x/y/z (unused before)
+        x = build_node_features(surface_type_ids, areas, self.num_surface_types,
+                                centroids=centroids)
 
         a1 = _edge_set(arrs["A_1_idx"], start, end)
         e1 = {_canonical_edge(u, v) for u, v in _edge_set(arrs["E_1_idx"], start, end)}
@@ -209,6 +224,9 @@ class MFCADPPGraphDataset(_H5PickleMixin, Dataset):
                 convexity.append(2)
             else:
                 convexity.append(1)
+            # MFCAD++ B-rep level stores no dihedral angle / edge length: every
+            # *_values array in the H5 is constant 1.0 (pure adjacency indicator),
+            # so convexity bucket is the only real edge signal. These stay constant.
             angles.append(0.0)
             lengths.append(1.0)
         ea = build_edge_features(
