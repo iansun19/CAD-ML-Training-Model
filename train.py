@@ -1,0 +1,127 @@
+"""
+train.py — overnight training entry point.
+
+Usage:
+    python train.py                  # uses config.yaml
+Outputs to runs/<timestamp>/:
+    best_model.pt   — weights at best val accuracy
+    log.txt         — per-epoch metrics (read this in the morning)
+    config_used.yaml
+"""
+
+import os
+import time
+import datetime
+import yaml
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch_geometric.loader import DataLoader
+
+from dataset import get_dataset
+from model import BRepGNN
+
+
+def set_seed(s):
+    import random
+    random.seed(s); np.random.seed(s)
+    torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+
+def accuracy(logits, y):
+    return (logits.argmax(dim=1) == y).float().mean().item()
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    correct = total = 0
+    for batch in loader:
+        batch = batch.to(device)
+        logits = model(batch.x, batch.edge_index, batch.edge_attr)
+        correct += (logits.argmax(1) == batch.y).sum().item()
+        total += batch.y.numel()
+    return correct / max(total, 1)
+
+
+def main():
+    with open("config.yaml") as f:
+        cfg = yaml.safe_load(f)
+    set_seed(cfg["seed"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = os.path.join(cfg["out_dir"], stamp)
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "config_used.yaml"), "w") as f:
+        yaml.safe_dump(cfg, f)
+    logf = open(os.path.join(out, "log.txt"), "w")
+
+    def log(msg):
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        print(line); logf.write(line + "\n"); logf.flush()
+
+    log(f"device={device}  out={out}")
+
+    train_ds = get_dataset(cfg, "train.txt")
+    val_ds = get_dataset(cfg, "val.txt")
+    test_ds = get_dataset(cfg, "test.txt")
+    log(f"sizes train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
+
+    train_ld = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True,
+                          num_workers=cfg["num_workers"], pin_memory=True)
+    val_ld = DataLoader(val_ds, batch_size=cfg["batch_size"],
+                        num_workers=cfg["num_workers"])
+    test_ld = DataLoader(test_ds, batch_size=cfg["batch_size"],
+                         num_workers=cfg["num_workers"])
+
+    # infer feature dims from one sample
+    sample = train_ds[0]
+    node_in, edge_in = sample.x.shape[1], sample.edge_attr.shape[1]
+    log(f"node_in={node_in} edge_in={edge_in}")
+
+    model = BRepGNN(node_in, edge_in, cfg["hidden_dim"], cfg["num_classes"],
+                    cfg["num_layers"], cfg["dropout"]).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"],
+                            weight_decay=cfg["weight_decay"])
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max",
+                                                       factor=0.5, patience=4)
+
+    best_val, best_epoch, bad = 0.0, -1, 0
+    for epoch in range(cfg["epochs"]):
+        model.train()
+        t0 = time.time()
+        run_loss = run_acc = nb = 0
+        for batch in train_ld:
+            batch = batch.to(device)
+            opt.zero_grad()
+            logits = model(batch.x, batch.edge_index, batch.edge_attr)
+            loss = F.cross_entropy(logits, batch.y)
+            loss.backward()
+            opt.step()
+            run_loss += loss.item(); run_acc += accuracy(logits, batch.y); nb += 1
+        val_acc = evaluate(model, val_ld, device)
+        sched.step(val_acc)
+        log(f"epoch {epoch:03d} | loss {run_loss/nb:.4f} | "
+            f"train_acc {run_acc/nb:.4f} | val_acc {val_acc:.4f} | "
+            f"{time.time()-t0:.1f}s")
+
+        if val_acc > best_val:
+            best_val, best_epoch, bad = val_acc, epoch, 0
+            torch.save(model.state_dict(), os.path.join(out, "best_model.pt"))
+            log(f"  ^ new best, saved.")
+        else:
+            bad += 1
+            if bad >= cfg["patience"]:
+                log(f"early stop (no val gain in {cfg['patience']} epochs).")
+                break
+
+    # final test with best weights
+    model.load_state_dict(torch.load(os.path.join(out, "best_model.pt")))
+    test_acc = evaluate(model, test_ld, device)
+    log(f"DONE. best_val={best_val:.4f}@{best_epoch} test_acc={test_acc:.4f}")
+    logf.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+# All knobs in one place. train.py and overfit_check.py read this.
+
+# --- Data ---
+data_root: "/path/to/MFCAD_dataset"   # <-- EDIT: your unzipped dataset folder
+loader: "h5"                          # "h5" (recommended) or "step"
+h5_path: "graphs.h5"                  # relative to data_root; verify the real name
+num_classes: 25                       # MFCAD++ feature classes; verify from labels file
+num_surface_types: 6                  # plane, cylinder, cone, sphere, torus, other
+
+# --- Model ---
+hidden_dim: 128
+num_layers: 4            # message-passing layers; 3-4 is the sweet spot for B-rep
+dropout: 0.2
+edge_dim: 5              # 3 (convex/concave/smooth one-hot) + 1 angle + 1 length
+
+# --- Training ---
+epochs: 60               # early stopping usually halts well before this
+batch_size: 64           # graphs per batch; lower if you hit OOM
+lr: 0.001
+weight_decay: 0.0001
+patience: 10             # early stop after N epochs with no val improvement
+seed: 42
+num_workers: 4
+
+# --- Output ---
+out_dir: "runs"

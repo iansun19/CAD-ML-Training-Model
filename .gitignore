@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Training artifacts
+runs/
+*.pt
+*.ckpt
+
+# Data — do NOT commit the 1.5GB dataset
+*.h5
+*.zip
+*.step
+*.stp
+data/
+MFCAD_dataset/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
