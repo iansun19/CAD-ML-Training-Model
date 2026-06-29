@@ -43,6 +43,11 @@ def main():
         cfg = yaml.safe_load(f)
     set_seed(cfg["seed"])
     device = resolve_device(cfg.get("device", "auto"))
+    if device.type == "cuda":
+        # free throughput on Ampere+ : allow TF32 matmuls and autotune kernels
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out = os.path.join(cfg["out_dir"], stamp)

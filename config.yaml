@@ -23,7 +23,7 @@ lr: 0.001
 weight_decay: 0.0001
 patience: 10             # early stop after N epochs with no val improvement
 seed: 42
-num_workers: 0
+num_workers: 4           # >0 to keep the GPU fed; persistent_workers reuses them
 
 # --- Output ---
 out_dir: "runs"
