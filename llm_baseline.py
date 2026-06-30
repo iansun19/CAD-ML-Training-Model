@@ -132,8 +132,25 @@ def strip_labels(step_text):
 # ---------------------------------------------------------------------------
 # prompt construction
 # ---------------------------------------------------------------------------
-def build_system_prompt(class_names):
+def build_system_prompt(class_names, bounded=False):
     listing = "\n".join(f"  {i} - {n}" for i, n in enumerate(class_names))
+    if bounded:
+        out_fmt = (
+            "OUTPUT FORMAT (STRICT): you will be given the EXACT list of face entity "
+            "ids to classify. Return a single JSON object whose keys are EXACTLY those "
+            "ids (and no others) mapping to the integer class id. Example:\n"
+            '{"#17": 24, "#619": 3, "#808": 15}\n'
+            "Classify only the listed faces — do NOT invent or enumerate any other "
+            "entity ids. Output ONLY the JSON object — no markdown, no commentary."
+        )
+    else:
+        out_fmt = (
+            "OUTPUT FORMAT (STRICT): a single JSON object mapping each face entity id "
+            '(string, including the leading "#") to its integer class id. Example:\n'
+            '{"#17": 24, "#619": 3, "#808": 15}\n'
+            "Include EVERY face entity id present in the file, exactly once. Output "
+            "ONLY the JSON object — no markdown, no commentary."
+        )
     return (
         "You are an expert in CAD B-rep geometry and CNC machining features. "
         "You are given the raw text of an ISO-10303-21 (STEP) file describing a "
@@ -146,19 +163,19 @@ def build_system_prompt(class_names):
         "Reason from the geometry: surface type (PLANE/CYLINDRICAL_SURFACE/CONICAL_"
         "SURFACE/etc.), the edge loops, how faces bound pockets/slots/steps/holes, "
         "and which faces are the original stock surfaces (class 24).\n\n"
-        "OUTPUT FORMAT (STRICT): a single JSON object mapping each face entity id "
-        '(string, including the leading "#") to its integer class id. Example:\n'
-        '{"#17": 24, "#619": 3, "#808": 15}\n'
-        "Include EVERY face entity id present in the file, exactly once. Output ONLY "
-        "the JSON object — no markdown, no commentary."
+        + out_fmt
     )
 
 
-def build_messages(class_names, step_text):
+def build_messages(class_names, step_text, face_ids=None, bounded=False):
+    user = "STEP file:\n\n" + step_text
+    if bounded:
+        ids = " ".join(face_ids)
+        user += (f"\n\nClassify EXACTLY these {len(face_ids)} face entity ids "
+                 f"(return a class for every one, and include no other ids):\n{ids}")
     return [
-        {"role": "system", "content": build_system_prompt(class_names)},
-        {"role": "user",
-         "content": "STEP file:\n\n" + step_text},
+        {"role": "system", "content": build_system_prompt(class_names, bounded)},
+        {"role": "user", "content": user},
     ]
 
 
@@ -325,7 +342,7 @@ def parse_retry_after(exc):
 
 
 async def run_one(client, sem, limiter, pid, cfg, class_names, keep_labels,
-                  model, temperature, max_retries):
+                  model, temperature, max_retries, bounded=False):
     """Send one part, retrying 429s (server-suggested wait) and transient errors
     (exponential backoff) independently. Backoff sleeps happen OUTSIDE the
     concurrency semaphore so a throttled request frees its slot for others."""
@@ -333,7 +350,8 @@ async def run_one(client, sem, limiter, pid, cfg, class_names, keep_labels,
     txt = open(step_path(cfg, pid)).read()
     faces = parse_faces(txt)  # ground-truth-derived ordering & true labels
     send_text = txt if keep_labels else strip_labels(txt)
-    messages = build_messages(class_names, send_text)
+    face_ids = [eid for eid, _ in faces]
+    messages = build_messages(class_names, send_text, face_ids, bounded)
     est = estimate_tokens(send_text, len(faces))
 
     attempt = 0
@@ -387,7 +405,8 @@ async def cmd_run(cfg, args):
     done = load_completed(paths["results"])
     todo = [p for p in ids if p not in done]
     print(f"model={args.model} temp={args.temperature} concurrency={args.concurrency} "
-          f"tpm={args.tpm} max_retries={args.max_retries} keep_labels={args.keep_labels}")
+          f"tpm={args.tpm} max_retries={args.max_retries} keep_labels={args.keep_labels} "
+          f"bounded={args.bounded}")
     print(f"total={len(ids)} already_done={len(ids) - len(todo)} todo={len(todo)}")
     if args.keep_labels:
         print("!! --keep-labels: label LEAK is active; numbers are NOT valid for comparison.")
@@ -409,7 +428,7 @@ async def cmd_run(cfg, args):
         try:
             rec = await run_one(client, sem, limiter, pid, cfg, class_names,
                                 args.keep_labels, args.model, args.temperature,
-                                args.max_retries)
+                                args.max_retries, args.bounded)
             async with lock:
                 res_f.write(json.dumps(rec) + "\n"); res_f.flush()
             n_ok += 1
@@ -444,7 +463,7 @@ async def cmd_run(cfg, args):
 # ---------------------------------------------------------------------------
 # evaluation
 # ---------------------------------------------------------------------------
-def cmd_eval(cfg, output=None):
+def cmd_eval(cfg, output=None, quiet=False):
     paths = out_paths(output)
     class_names = load_class_names(cfg["data_root"], cfg["num_classes"])
     C = cfg["num_classes"]
@@ -551,7 +570,9 @@ def cmd_eval(cfg, output=None):
 
     lines = []
     def out(s=""):
-        lines.append(s); print(s)
+        lines.append(s)
+        if not quiet:
+            print(s)
 
     out("=" * 70)
     out("LLM BASELINE (GPT-4o-mini, raw STEP text) — RECONSTRUCTION")
@@ -641,6 +662,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     ap.add_argument("--keep-labels", action="store_true",
                     help="DO NOT strip leaked labels (demonstrates leak; invalid metrics)")
+    ap.add_argument("--bounded", action="store_true",
+                    help="give the model the explicit face-id list (bounds output, "
+                         "prevents runaway entity enumeration); free-range if omitted")
     ap.add_argument("--output", default=None,
                     help="artifact path PREFIX (keeps concurrent runs separate); "
                          "writes <prefix>.jsonl/.errors.jsonl/.report.txt/.cm.csv")
