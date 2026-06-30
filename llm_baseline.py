@@ -64,6 +64,7 @@ import numpy as np
 import yaml
 
 from evaluate import load_class_names, per_class_metrics
+from dataset import _brep_bounds, _edge_set, _canonical_edge, SPLIT_H5
 
 # ---------------------------------------------------------------------------
 # config / constants
@@ -226,6 +227,318 @@ def coerce_class(value, name_to_id, num_classes):
 
 
 # ---------------------------------------------------------------------------
+# --features mode: serialize the SAME geometric features the GNN consumes
+# ---------------------------------------------------------------------------
+# This block is purely ADDITIVE. It does not touch parse_faces / strip_labels /
+# build_messages / the runner's retry/backoff/heartbeat/resumable machinery — it
+# only swaps the INPUT representation (raw STEP text -> serialized features) when
+# --features is set. Features come from the regenerated MFCAD++ H5 (the exact
+# source dataset.py's build_node_features_regen / build_edge_features_regen read),
+# NOT from re-parsing STEP geometry. No pythonocc / STEP kernel is used.
+#
+# IMPORTANT — area units. The spec asked for area in cm² via exp(log_area). The
+# GNN's actual source (regen V_1 col 0) stores area PER-PART MIN-MAX NORMALIZED to
+# [0,1] (0 = smallest face in the part, 1 = largest); there is no log-area and no
+# physical cm² recoverable from it. To stay faithful to "the same features the GNN
+# uses", we serialize that relative area and label it as such rather than inventing
+# a cm² value. Normal is the exact per-face unit vector; centroid is the per-part
+# [0,1]-normalized centroid; plane offset d is the raw signed plane distance (real
+# model units), so it is only emitted for planar faces.
+SURFACE_TYPES = ["plane", "cylinder", "cone", "sphere", "torus", "other"]
+CONVEXITY_NAMES = ["concave", "convex", "smooth"]  # 0=concave,1=convex,2=smooth
+
+# One-line geometric signature of each MFCAD++ class (ids match feature_labels.txt).
+CLASS_DESCRIPTIONS = [
+    "Chamfer: narrow planar bevel joining two faces at an oblique angle (~45°).",
+    "Through hole: a single cylindrical face passing entirely through the part, open at both ends.",
+    "Triangular passage: through opening with a 3-walled (triangular) planar cross-section, open both ends.",
+    "Rectangular passage: through opening with 4 planar walls (rectangular section), open both ends.",
+    "6-sided passage: through opening with 6 planar walls (hexagonal section), open both ends.",
+    "Triangular through slot: triangular-profile channel cut fully across the part, open at both ends and top.",
+    "Rectangular through slot: rectangular channel (floor + 2 walls) cut fully across, open at both ends and top.",
+    "Circular through slot: through channel with cylindrical (rounded) walls, open at both ends and top.",
+    "Rectangular through step: L-shaped shoulder running fully across the part, open at both ends.",
+    "2-sided through step: step open on two sides of the part.",
+    "Slanted through step: through step whose wall/floor is slanted — planar faces meeting at a non-90° oblique dihedral.",
+    "O-ring: a circular ring groove (toroidal/cylindrical channel) recessed into a face.",
+    "Blind hole: cylindrical hole that does NOT pass through — a cylinder wall plus a flat bottom.",
+    "Triangular pocket: closed blind pocket with a triangular floor (3 walls + floor), open only at the top.",
+    "Rectangular pocket: closed blind pocket with a rectangular floor (4 walls + floor), open only at the top.",
+    "6-sided pocket: closed blind pocket with a hexagonal floor (6 walls + floor), open only at the top.",
+    "Circular end pocket: blind pocket with rounded (cylindrical) ends — curved walls + floor.",
+    "Rectangular blind slot: slot closed at one end (floor + 3 walls), open at the other end and the top.",
+    "Vertical circular end blind slot: blind slot terminated by a vertically-oriented circular (cylindrical) end.",
+    "Horizontal circular end blind slot: blind slot terminated by a horizontally-oriented circular (cylindrical) end.",
+    "Triangular blind step: step closed at one end with a triangular profile.",
+    "Circular blind step: blind step bounded by a circular/cylindrical wall.",
+    "Rectangular blind step: step closed at one end with a rectangular profile.",
+    "Round: a fillet — a rounded (cylindrical/toroidal) face blending two faces across a smooth/tangent edge.",
+    "Stock: original raw-material outer surface — large planar faces forming the part's outer bounding box, typically convex neighbors.",
+]
+
+# Few-shot exemplar classes, spanning simple (Stock) to hard orientation-dependent.
+FEWSHOT_CLASSES = [0, 6, 10, 17, 24]
+
+
+def _regen_h5_path(cfg, split_file):
+    return os.path.join(cfg["data_root"], cfg["h5_dir"], SPLIT_H5[split_file])
+
+
+def open_regen_split(cfg, split_file):
+    """Open a regenerated split H5 and build a pid -> (batch_key, model_idx) index."""
+    import h5py
+    h5 = h5py.File(_regen_h5_path(cfg, split_file), "r")
+    index = {}
+    for bk in h5.keys():
+        for i, raw in enumerate(h5[bk]["CAD_model"][()]):
+            pid = raw.decode() if isinstance(raw, bytes) else str(raw)
+            index[pid] = (bk, i)
+    return h5, index
+
+
+def part_features(h5, index, cfg, pid):
+    """Per-face geometric features for one part, in H5/file/label order.
+
+    Mirrors MFCADPPRegenGraphDataset._read_sample's edge construction exactly
+    (concave-first convexity, median dihedral) but keeps the raw V_1 values and
+    per-face neighbour lists for human-readable serialization. Returns a list of
+    dicts, one per face, index i aligning with label index i (== i-th ADVANCED_FACE).
+    """
+    nst = cfg["num_surface_types"]
+    bk, mi = index[pid]
+    batch = h5[bk]
+    idx_arr = batch["idx"][()]
+    v1_len = batch["V_1"].shape[0]
+    s, e = _brep_bounds(idx_arr, mi, v1_len)
+    v1 = np.asarray(batch["V_1"][s:e], dtype=np.float32)
+    n = e - s
+
+    def eset(name):
+        return {_canonical_edge(u, v) for u, v in _edge_set(batch[name][()], s, e)
+                if u != v}
+    e1, e2, e3 = eset("E_1_idx"), eset("E_2_idx"), eset("E_3_idx")
+
+    a1 = batch["A_1_idx"][()]
+    av = batch["A_1_values"][()]
+    mask = ((a1[:, 0] >= s) & (a1[:, 0] < e) &
+            (a1[:, 1] >= s) & (a1[:, 1] < e))
+    rows = a1[mask] - s
+    vals = av[mask]
+    ang_by_pair = {}
+    for (u, v), ang in zip(rows.tolist(), vals.tolist()):
+        if u == v:
+            continue
+        ang_by_pair.setdefault(_canonical_edge(u, v), []).append(float(ang))
+
+    reduce_fn = np.mean if cfg.get("angle_reduce") == "mean" else np.median
+    # build directed adjacency in the same column order make_undirected produces:
+    # all forward pairs first, then all reversed pairs.
+    pairs, conv, deg = [], [], []
+    for key, angs in ang_by_pair.items():
+        if key in e2:        # concave-first precedence (keep the concave edge)
+            cid = 0
+        elif key in e1:
+            cid = 1
+        elif key in e3:
+            cid = 2
+        else:
+            cid = 1
+        cosv = float(np.cos(float(reduce_fn(angs))))
+        pairs.append(key)
+        conv.append(cid)
+        deg.append(round(float(np.degrees(np.arccos(np.clip(cosv, -1.0, 1.0)))), 1))
+
+    nbrs = [[] for _ in range(n)]
+    for i, (u, v) in enumerate(pairs):
+        nbrs[u].append((v, CONVEXITY_NAMES[conv[i]], deg[i]))
+    for i, (u, v) in enumerate(pairs):
+        nbrs[v].append((u, CONVEXITY_NAMES[conv[i]], deg[i]))
+
+    faces = []
+    for i in range(n):
+        t = int(np.clip(round(float(v1[i, 4]) * 11) - 1, 0, nst - 1))
+        faces.append({
+            "type": SURFACE_TYPES[t],
+            "area": float(v1[i, 0]),
+            "normal": (float(v1[i, 5]), float(v1[i, 6]), float(v1[i, 7])),
+            "centroid": (float(v1[i, 1]), float(v1[i, 2]), float(v1[i, 3])),
+            "plane_d": float(v1[i, 8]),
+            "neighbors": nbrs[i],
+        })
+    return faces
+
+
+def serialize_face(face, entity_ids, idx):
+    """One human-readable face block. entity_ids maps face index -> '#NNN'."""
+    nx, ny, nz = face["normal"]
+    cx, cy, cz = face["centroid"]
+    lines = [f"Face {entity_ids[idx]} [{face['type']}]"]
+    lines.append(f"  relative area: {face['area']:.3f}  (0 = smallest, 1 = largest face in part)")
+    lines.append(f"  normal: ({nx:.2f}, {ny:.2f}, {nz:.2f})")
+    lines.append(f"  centroid (normalized 0-1): ({cx:.2f}, {cy:.2f}, {cz:.2f})")
+    if face["type"] == "plane":
+        lines.append(f"  plane offset d: {face['plane_d']:.2f}")
+    nb = face["neighbors"]
+    lines.append(f"  neighbors ({len(nb)}):")
+    for nidx, cstr, d in nb:
+        lines.append(f"    → {entity_ids[nidx]:<6} {cstr:<8} {d:.1f}°")
+    return "\n".join(lines)
+
+
+def serialize_part(faces, entity_ids):
+    """Serialize all faces of a part. Requires feature count == STEP face count."""
+    if len(faces) != len(entity_ids):
+        raise ValueError(
+            f"feature/STEP face count mismatch: {len(faces)} features vs "
+            f"{len(entity_ids)} ADVANCED_FACE entities")
+    return "\n\n".join(serialize_face(f, entity_ids, i) for i, f in enumerate(faces))
+
+
+def build_fewshot(cfg, class_names):
+    """Build the fixed few-shot block from the TRAINING set ONLY (never val/test,
+    so there is no leakage into the test-set evaluation). One representative face
+    is drawn for each of FEWSHOT_CLASSES from the first training part that contains
+    that class. Computed once and reused as fixed context for every API call."""
+    h5, index = open_regen_split(cfg, "train.txt")  # TRAIN split — confirmed no leak
+    try:
+        train_ids = []
+        with open(os.path.join(cfg["data_root"], "train.txt")) as f:
+            train_ids = [ln.strip() for ln in f if ln.strip()]
+        train_ids = [p for p in train_ids if p in index]
+
+        blocks = []
+        for cls in FEWSHOT_CLASSES:
+            found = None
+            for pid in train_ids:
+                bk, mi = index[pid]
+                batch = h5[bk]
+                s, e = _brep_bounds(batch["idx"][()], mi, batch["V_1"].shape[0])
+                labels = np.asarray(batch["labels"][s:e], dtype=np.int64)
+                hits = np.where(labels == cls)[0]
+                if len(hits):
+                    faces = part_features(h5, index, cfg, pid)
+                    # fabricate entity ids local to the example (only for display)
+                    eids = [f"#{j}" for j in range(len(faces))]
+                    fi = int(hits[0])
+                    block = serialize_face(faces[fi], eids, fi)
+                    found = f"{block}\n→ class: {cls} ({class_names[cls]})"
+                    break
+            if found is None:
+                found = f"(no training example found for class {cls})"
+            blocks.append(found)
+        return "\n\n".join(blocks)
+    finally:
+        h5.close()
+
+
+def build_feature_system_prompt(class_names, fewshot_text):
+    listing = "\n".join(f"  {i} - {CLASS_DESCRIPTIONS[i]}" for i in range(len(class_names)))
+    out_fmt = (
+        "OUTPUT FORMAT (STRICT): you will be given the EXACT list of face entity "
+        "ids to classify. Return a single JSON object whose keys are EXACTLY those "
+        "ids (and no others) mapping to the integer class id. Example:\n"
+        '{"#17": 24, "#619": 3, "#808": 15}\n'
+        "Classify only the listed faces — do NOT invent or enumerate any other "
+        "entity ids. You MUST output a prediction for every listed id. Output ONLY "
+        "the JSON object — no markdown, no commentary."
+    )
+    return (
+        "You are an expert in CAD B-rep geometry and CNC machining features. "
+        "Instead of raw STEP text, you are given a SERIALIZED, decoded description "
+        "of every face of a single solid part: its surface type, relative area, "
+        "exact unit normal, normalized centroid, plane offset, and its adjacency to "
+        "other faces (each neighbour labelled concave / convex / smooth with the "
+        "dihedral angle in degrees). These are the same geometric features a graph "
+        "neural network uses. Reason from this geometry — surface types, dihedral "
+        "convexity, how faces bound pockets/slots/steps/holes, and which faces are "
+        "the original stock surfaces (class 24).\n\n"
+        "Classify EVERY listed face into exactly one of these 25 machining-feature "
+        "classes (use the integer id):\n"
+        f"{listing}\n\n"
+        "WORKED EXAMPLES (input face block -> correct class):\n"
+        f"{fewshot_text}\n\n"
+        + out_fmt
+    )
+
+
+def build_feature_messages(class_names, faces_text, face_ids, fewshot_text):
+    ids = " ".join(face_ids)
+    user = (
+        "PART FACES:\n\n" + faces_text +
+        f"\n\nClassify EXACTLY these {len(face_ids)} face entity ids "
+        f"(return a class for every one, and include no other ids):\n{ids}"
+    )
+    return [
+        {"role": "system", "content": build_feature_system_prompt(class_names, fewshot_text)},
+        {"role": "user", "content": user},
+    ]
+
+
+def _enc():
+    try:
+        import tiktoken
+        return tiktoken.get_encoding("o200k_base")
+    except Exception:
+        return None
+
+
+def cmd_features_audit(cfg, n_parts=3):
+    """--features --audit-only: serialize the first N test parts and print them so
+    the representation can be inspected by eye BEFORE any API call is made."""
+    class_names = load_class_names(cfg["data_root"], cfg["num_classes"])
+    enc = _enc()
+    ids = read_test_ids(cfg)
+    h5, index = open_regen_split(cfg, "test.txt")
+    try:
+        print("=" * 72)
+        print("FEW-SHOT BLOCK (fixed context, drawn from TRAINING set only):")
+        print("=" * 72)
+        fewshot = build_fewshot(cfg, class_names)
+        print(fewshot)
+        print()
+        for pid in ids[:n_parts]:
+            txt = open(step_path(cfg, pid)).read()
+            faces_gt = parse_faces(txt)              # ground-truth ordering & labels
+            entity_ids = [eid for eid, _ in faces_gt]
+            feats = part_features(h5, index, cfg, pid)
+            print("=" * 72)
+            print(f"PART {pid}")
+            ok = len(feats) == len(entity_ids)
+            print(f"  face count: features={len(feats)}  STEP/GT={len(entity_ids)}  "
+                  f"{'MATCH' if ok else '*** MISMATCH ***'}")
+            if not ok:
+                print("  (skipping serialization — counts must match)")
+                continue
+            text = serialize_part(feats, entity_ids)
+            # full prompt token estimate
+            face_ids = entity_ids
+            messages = build_feature_messages(class_names, text, face_ids, fewshot)
+            if enc:
+                tot = sum(len(enc.encode(m["content"])) for m in messages)
+                flag = "  <-- EXCEEDS 8000, consider truncating neighbors" if tot > 8000 else ""
+                print(f"  full prompt tokens (system+fewshot+faces): {tot}{flag}")
+            # plausibility summary
+            all_deg = [d for f in feats for _, _, d in f["neighbors"]]
+            nbr_counts = [len(f["neighbors"]) for f in feats]
+            types = sorted({f["type"] for f in feats})
+            areas = [f["area"] for f in feats]
+            print(f"  surface types present: {types}")
+            print(f"  relative area range: {min(areas):.3f}..{max(areas):.3f}")
+            print(f"  neighbors/face: min {min(nbr_counts)} max {max(nbr_counts)}")
+            if all_deg:
+                print(f"  dihedral angle range: {min(all_deg):.1f}°..{max(all_deg):.1f}°")
+            print("-" * 72)
+            print(text)
+            print()
+        print("=" * 72)
+        print("AUDIT CHECKLIST: confirm face counts MATCH, dihedral angles are in "
+              "[0,180]°, surface types decode sensibly, and relative areas are in "
+              "[0,1] (NOT log-scale). Only then proceed to --run.")
+    finally:
+        h5.close()
+
+
+# ---------------------------------------------------------------------------
 # audit
 # ---------------------------------------------------------------------------
 def cmd_audit(cfg):
@@ -342,16 +655,23 @@ def parse_retry_after(exc):
 
 
 async def run_one(client, sem, limiter, pid, cfg, class_names, keep_labels,
-                  model, temperature, max_retries, bounded=False):
+                  model, temperature, max_retries, bounded=False,
+                  features=False, feature_prompts=None, fewshot_text=None):
     """Send one part, retrying 429s (server-suggested wait) and transient errors
     (exponential backoff) independently. Backoff sleeps happen OUTSIDE the
     concurrency semaphore so a throttled request frees its slot for others."""
     import openai
     txt = open(step_path(cfg, pid)).read()
     faces = parse_faces(txt)  # ground-truth-derived ordering & true labels
-    send_text = txt if keep_labels else strip_labels(txt)
     face_ids = [eid for eid, _ in faces]
-    messages = build_messages(class_names, send_text, face_ids, bounded)
+    if features:
+        # input representation = serialized GNN features (NOT raw STEP text);
+        # everything else (ordering, eval, retry, output) is identical.
+        send_text = feature_prompts[pid]
+        messages = build_feature_messages(class_names, send_text, face_ids, fewshot_text)
+    else:
+        send_text = txt if keep_labels else strip_labels(txt)
+        messages = build_messages(class_names, send_text, face_ids, bounded)
     est = estimate_tokens(send_text, len(faces))
 
     attempt = 0
@@ -406,12 +726,57 @@ async def cmd_run(cfg, args):
     todo = [p for p in ids if p not in done]
     print(f"model={args.model} temp={args.temperature} concurrency={args.concurrency} "
           f"tpm={args.tpm} max_retries={args.max_retries} keep_labels={args.keep_labels} "
-          f"bounded={args.bounded}")
+          f"bounded={args.bounded} features={args.features}")
     print(f"total={len(ids)} already_done={len(ids) - len(todo)} todo={len(todo)}")
     if args.keep_labels:
         print("!! --keep-labels: label LEAK is active; numbers are NOT valid for comparison.")
     if not todo:
         print("nothing to do."); return
+
+    # --features: precompute the serialized-feature prompt for every todo part up
+    # front (single-threaded H5 reads, avoids h5py thread-safety issues) and build
+    # the fixed few-shot block once. Parts whose feature count != STEP face count
+    # are logged as errors and dropped before any API call.
+    feature_prompts = None
+    fewshot_text = None
+    if args.features:
+        enc = _enc()
+        fewshot_text = build_fewshot(cfg, class_names)
+        h5, index = open_regen_split(cfg, "test.txt")
+        feature_prompts = {}
+        skipped = []
+        max_tok = 0
+        err_f0 = open(paths["errors"], "a")
+        try:
+            for pid in todo:
+                txt = open(step_path(cfg, pid)).read()
+                entity_ids = [eid for eid, _ in parse_faces(txt)]
+                try:
+                    feats = part_features(h5, index, cfg, pid)
+                    feature_prompts[pid] = serialize_part(feats, entity_ids)
+                except Exception as e:
+                    err_f0.write(json.dumps({"part_id": pid, "error": repr(e)}) + "\n")
+                    skipped.append(pid)
+                    continue
+                if enc:
+                    msgs = build_feature_messages(class_names, feature_prompts[pid],
+                                                  entity_ids, fewshot_text)
+                    tk = sum(len(enc.encode(m["content"])) for m in msgs)
+                    max_tok = max(max_tok, tk)
+                    if tk > 8000:
+                        print(f"!! {pid}: prompt is {tk} tokens (>8000) — unusually "
+                              f"large; consider truncating neighbors.")
+        finally:
+            err_f0.close()
+            h5.close()
+        todo = [p for p in todo if p in feature_prompts]
+        if skipped:
+            print(f"!! dropped {len(skipped)} parts on feature/STEP count mismatch: "
+                  f"{skipped[:10]}")
+        if enc:
+            print(f"feature prompts ready: {len(todo)}  max prompt tokens={max_tok}")
+        if not todo:
+            print("nothing to do."); return
 
     client = AsyncOpenAI(max_retries=0)     # we own retry/backoff, not the SDK
     sem = asyncio.Semaphore(args.concurrency)
@@ -428,7 +793,8 @@ async def cmd_run(cfg, args):
         try:
             rec = await run_one(client, sem, limiter, pid, cfg, class_names,
                                 args.keep_labels, args.model, args.temperature,
-                                args.max_retries, args.bounded)
+                                args.max_retries, args.bounded,
+                                args.features, feature_prompts, fewshot_text)
             async with lock:
                 res_f.write(json.dumps(rec) + "\n"); res_f.flush()
             n_ok += 1
@@ -665,12 +1031,21 @@ def main():
     ap.add_argument("--bounded", action="store_true",
                     help="give the model the explicit face-id list (bounds output, "
                          "prevents runaway entity enumeration); free-range if omitted")
+    ap.add_argument("--features", action="store_true",
+                    help="input = serialized GNN geometric features instead of raw "
+                         "STEP text (bounded face-id list; same eval/output path)")
+    ap.add_argument("--audit-only", dest="audit_only", action="store_true",
+                    help="with --features: serialize 3 test parts and print them for "
+                         "inspection, make NO API calls")
     ap.add_argument("--output", default=None,
                     help="artifact path PREFIX (keeps concurrent runs separate); "
                          "writes <prefix>.jsonl/.errors.jsonl/.report.txt/.cm.csv")
     args = ap.parse_args()
     cfg = load_cfg(args.config)
 
+    if args.features and args.audit_only:
+        cmd_features_audit(cfg)
+        return
     if args.audit:
         cmd_audit(cfg)
     if args.run:

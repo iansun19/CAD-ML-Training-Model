@@ -30,6 +30,7 @@ LLM_RUNS = [
     ("LLM free-range, unstripped (MVP as-is)", "unstripped_run"),
     ("LLM bounded, stripped (fair ceiling)",   "bounded_stripped"),
     ("LLM bounded, unstripped (+leak)",        "bounded_unstripped"),
+    ("LLM features (serialized GNN geom)",      "features_run"),
 ]
 
 
