@@ -44,7 +44,8 @@ that ordering, then score against the same 25-class metric evaluate.py uses.
 USAGE
 -----
   python llm_baseline.py --audit                 # print leak/token/alignment audit
-  python llm_baseline.py --run [--limit N] [--concurrency 8] [--keep-labels]
+  python llm_baseline.py --run [--limit N] [--concurrency 4] [--tpm 180000]
+                               [--max-retries 5] [--keep-labels] [--output PREFIX]
   python llm_baseline.py --eval                  # score whatever's in the results file
   python llm_baseline.py --run --eval            # do both
 
@@ -57,6 +58,7 @@ import json
 import os
 import re
 import time
+from collections import deque
 
 import numpy as np
 import yaml
@@ -71,6 +73,10 @@ DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_TEMPERATURE = 0.0
 # gpt-4o-mini context = 128k. Leave headroom for system prompt + output.
 MAX_INPUT_TOKENS = 110_000
+# org TPM ceiling for gpt-4o-mini is 200k; default budget leaves ~10% headroom so
+# our own throttle keeps us under it instead of relying on 429s.
+DEFAULT_TPM = 180_000
+DEFAULT_MAX_RETRIES = 5
 
 RESULTS_FILE = "llm_baseline_results.jsonl"   # one JSON line per completed part
 ERRORS_FILE = "llm_baseline_errors.jsonl"     # malformed / failed parts
@@ -256,30 +262,117 @@ def load_completed(path):
     return done
 
 
-async def run_one(client, sem, pid, cfg, class_names, keep_labels, model, temperature):
+class TokenRateLimiter:
+    """Sliding-60s-window token admission gate, sized to the org's TPM ceiling.
+
+    Before a request is sent, acquire(est) reserves its estimated tokens and blocks
+    until the tokens admitted in the trailing 60s + est stays under `tpm`. This keeps
+    us under the limit by design instead of firing requests blindly and eating 429s.
+    The lock is held only for the brief bookkeeping, never across a sleep, so a
+    throttled request never blocks an unrelated one.
+    """
+
+    def __init__(self, tpm):
+        self.tpm = tpm
+        self.window = 60.0
+        self.events = deque()        # (timestamp, tokens)
+        self.lock = asyncio.Lock()
+
+    def _purge(self, now):
+        while self.events and now - self.events[0][0] > self.window:
+            self.events.popleft()
+
+    async def acquire(self, est):
+        # a single request larger than the whole budget can only run alone
+        est = min(est, self.tpm)
+        while True:
+            async with self.lock:
+                now = time.monotonic()
+                self._purge(now)
+                cur = sum(t for _, t in self.events)
+                if not self.events or cur + est <= self.tpm:
+                    self.events.append((now, est))
+                    return
+                wait = self.window - (now - self.events[0][0])
+            await asyncio.sleep(min(max(wait, 0.05), self.window))
+
+
+def estimate_tokens(send_text, n_faces):
+    """Rough TPM accounting: input chars/4 + system/task overhead + JSON output."""
+    return len(send_text) // 4 + 700 + n_faces * 10
+
+
+def parse_retry_after(exc):
+    """Seconds the API asked us to wait, from headers or the error message."""
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        h = getattr(resp, "headers", {}) or {}
+        if "retry-after-ms" in h:
+            try:
+                return float(h["retry-after-ms"]) / 1000.0
+            except (TypeError, ValueError):
+                pass
+        if "retry-after" in h:
+            try:
+                return float(h["retry-after"])
+            except (TypeError, ValueError):
+                pass
+    m = re.search(r"try again in ([\d.]+)\s*(ms|s)", str(exc))
+    if m:
+        v = float(m.group(1))
+        return v / 1000.0 if m.group(2) == "ms" else v
+    return None
+
+
+async def run_one(client, sem, limiter, pid, cfg, class_names, keep_labels,
+                  model, temperature, max_retries):
+    """Send one part, retrying 429s (server-suggested wait) and transient errors
+    (exponential backoff) independently. Backoff sleeps happen OUTSIDE the
+    concurrency semaphore so a throttled request frees its slot for others."""
+    import openai
     txt = open(step_path(cfg, pid)).read()
     faces = parse_faces(txt)  # ground-truth-derived ordering & true labels
     send_text = txt if keep_labels else strip_labels(txt)
     messages = build_messages(class_names, send_text)
-    async with sem:
-        t0 = time.monotonic()
-        resp = await client.chat.completions.create(
-            model=model, temperature=temperature, messages=messages,
-            response_format={"type": "json_object"},
-        )
-        dt = time.monotonic() - t0
-    choice = resp.choices[0].message.content or ""
-    usage = resp.usage
-    return {
-        "part_id": pid,
-        "raw_response": choice,
-        "n_faces": len(faces),
-        "entity_ids": [eid for eid, _ in faces],
-        "true_labels": [lbl for _, lbl in faces],
-        "latency_s": round(dt, 3),
-        "prompt_tokens": getattr(usage, "prompt_tokens", None),
-        "completion_tokens": getattr(usage, "completion_tokens", None),
-    }
+    est = estimate_tokens(send_text, len(faces))
+
+    attempt = 0
+    while True:
+        await limiter.acquire(est)          # TPM gate (waits without holding sem)
+        wait = None
+        try:
+            async with sem:                 # bounds concurrent in-flight sockets
+                t0 = time.monotonic()
+                resp = await client.chat.completions.create(
+                    model=model, temperature=temperature, messages=messages,
+                    response_format={"type": "json_object"},
+                )
+                dt = time.monotonic() - t0
+            choice = resp.choices[0].message.content or ""
+            usage = resp.usage
+            return {
+                "part_id": pid, "raw_response": choice, "n_faces": len(faces),
+                "entity_ids": [eid for eid, _ in faces],
+                "true_labels": [lbl for _, lbl in faces],
+                "latency_s": round(dt, 3), "attempts": attempt + 1,
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+            }
+        except openai.RateLimitError as e:
+            attempt += 1
+            if attempt > max_retries:
+                raise
+            ra = parse_retry_after(e)
+            wait = (ra + 1.0) if ra is not None else min(2 ** attempt, 30)
+        except (openai.APITimeoutError, openai.APIConnectionError,
+                openai.InternalServerError) as e:
+            attempt += 1
+            if attempt > max_retries:
+                raise
+            ra = parse_retry_after(e)
+            wait = (ra + 1.0) if ra is not None else min(2 ** attempt, 30)
+        # sleep here, outside `async with sem`, so other requests keep flowing
+        await asyncio.sleep(wait)
 
 
 async def cmd_run(cfg, args):
@@ -294,44 +387,58 @@ async def cmd_run(cfg, args):
     done = load_completed(paths["results"])
     todo = [p for p in ids if p not in done]
     print(f"model={args.model} temp={args.temperature} concurrency={args.concurrency} "
-          f"keep_labels={args.keep_labels}")
+          f"tpm={args.tpm} max_retries={args.max_retries} keep_labels={args.keep_labels}")
     print(f"total={len(ids)} already_done={len(ids) - len(todo)} todo={len(todo)}")
     if args.keep_labels:
         print("!! --keep-labels: label LEAK is active; numbers are NOT valid for comparison.")
     if not todo:
         print("nothing to do."); return
 
-    client = AsyncOpenAI()
+    client = AsyncOpenAI(max_retries=0)     # we own retry/backoff, not the SDK
     sem = asyncio.Semaphore(args.concurrency)
+    limiter = TokenRateLimiter(args.tpm)
     res_f = open(paths["results"], "a")
     err_f = open(paths["errors"], "a")
-    n_ok = n_err = 0
+    n_ok = n_err = in_flight = 0
     t_start = time.monotonic()
     lock = asyncio.Lock()
 
     async def worker(pid):
-        nonlocal n_ok, n_err
+        nonlocal n_ok, n_err, in_flight
+        in_flight += 1
         try:
-            rec = await run_one(client, sem, pid, cfg, class_names,
-                                args.keep_labels, args.model, args.temperature)
+            rec = await run_one(client, sem, limiter, pid, cfg, class_names,
+                                args.keep_labels, args.model, args.temperature,
+                                args.max_retries)
             async with lock:
                 res_f.write(json.dumps(rec) + "\n"); res_f.flush()
-                n_ok += 1
-                if (n_ok + n_err) % 50 == 0:
-                    rate = (n_ok + n_err) / (time.monotonic() - t_start)
-                    print(f"  {n_ok+n_err}/{len(todo)}  ok={n_ok} err={n_err} "
-                          f"{rate:.1f}/s", flush=True)
+            n_ok += 1
         except Exception as e:
             async with lock:
                 err_f.write(json.dumps({"part_id": pid, "error": repr(e)}) + "\n")
                 err_f.flush()
-                n_err += 1
+            n_err += 1
+        finally:
+            in_flight -= 1
 
-    await asyncio.gather(*(worker(p) for p in todo))
+    async def heartbeat():
+        while True:
+            await asyncio.sleep(10)
+            elapsed = time.monotonic() - t_start
+            rate = (n_ok + n_err) / max(elapsed, 1)
+            print(f"[hb] {n_ok+n_err}/{len(todo)} done  ok={n_ok} failed={n_err} "
+                  f"in_flight={in_flight}  {rate:.2f}/s  elapsed={elapsed:.0f}s",
+                  flush=True)
+
+    hb = asyncio.create_task(heartbeat())
+    try:
+        await asyncio.gather(*(worker(p) for p in todo))
+    finally:
+        hb.cancel()
     res_f.close(); err_f.close()
     dt = time.monotonic() - t_start
     print(f"\ndone: ok={n_ok} api_errors={n_err} in {dt:.0f}s "
-          f"({(n_ok+n_err)/max(dt,1):.1f} calls/s)")
+          f"({(n_ok+n_err)/max(dt,1):.2f} calls/s)")
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +631,12 @@ def main():
     ap.add_argument("--run", action="store_true", help="run the LLM over the test set")
     ap.add_argument("--eval", action="store_true", help="score the results file")
     ap.add_argument("--limit", type=int, default=0, help="only first N test parts (smoke test)")
-    ap.add_argument("--concurrency", type=int, default=8)
+    ap.add_argument("--concurrency", type=int, default=4,
+                    help="max in-flight requests (the TPM limiter is the real throttle)")
+    ap.add_argument("--tpm", type=int, default=DEFAULT_TPM,
+                    help="token-per-minute budget; throttle stays under the org ceiling")
+    ap.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                    help="per-request retries for 429 / transient errors")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     ap.add_argument("--keep-labels", action="store_true",
