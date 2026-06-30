@@ -144,6 +144,58 @@ def build_edge_features(convexity_ids, angles, lengths):
     return np.concatenate([onehot, ang, ln], axis=1)
 
 
+def build_node_features_regen(v1, num_surface_types):
+    """14-dim node features from a regenerated V_1 block [N, 9].
+
+    Layout of the regenerated V_1 (see diag/regen_dataset.py):
+      col 0    : area      (per-model min-max -> [0,1])
+      col 1-3  : centroid  (per-model min-max -> [0,1])
+      col 4    : surface-type code / 11   (plane=1..cone=5, other=11)
+      col 5-7  : exact per-face UNIT normal (nx, ny, nz)            <-- new, reliable
+      col 8    : plane-d = n . centroid    (raw signed offset)      <-- new, reliable
+
+    Output (14) = onehot surface type(6) + area(1) + centroid(3) + unit normal(3)
+                  + plane-d(1). The first 10 dims mirror the previous pipeline
+    (surface type / area / centroid); the trailing 4 replace the old broken
+    V_2-pooled mesh block with exact geometry read straight from V_1 — no decode,
+    no facet pooling.
+    """
+    v1 = np.asarray(v1, dtype=np.float32)
+    n = v1.shape[0]
+    type_ids = np.clip(np.round(v1[:, 4] * 11).astype(int) - 1,
+                       0, num_surface_types - 1)
+    onehot = np.zeros((n, num_surface_types), dtype=np.float32)
+    onehot[np.arange(n), type_ids] = 1.0
+    # area already min-max [0,1]; standardize per part so big parts don't dominate
+    area = v1[:, 0:1].copy()
+    area = (area - area.mean()) / (area.std() + 1e-6)
+    # centroid already [0,1]; center per part (relative layout, not absolute pos)
+    cent = v1[:, 1:4].copy()
+    cent = cent - cent.mean(axis=0, keepdims=True)
+    # exact unit normal: already bounded [-1,1], used raw (no decode/pool)
+    normal = v1[:, 5:8].copy()
+    # plane-d: raw and large-ranged -> signed-log then per-part standardize
+    d = v1[:, 8:9].copy()
+    d = np.sign(d) * np.log1p(np.abs(d))
+    d = (d - d.mean()) / (d.std() + 1e-6)
+    return np.concatenate([onehot, area, cent, normal, d], axis=1)
+
+
+def build_edge_features_regen(convexity_ids, cos_angles):
+    """convexity one-hot(3) + cos(dihedral)(1) -> [E, 4].
+
+    convexity id: 0=concave, 1=convex, 2=smooth (same scheme as build_edge_features).
+    The angle is stored as cos(dihedral): bounded in [-1,1], with the geometrically
+    meaningful anchors 0 deg -> +1, 90 deg -> 0, 180 deg -> -1. Replaces the old
+    constant-1.0 angle/length placeholders, which carried no signal.
+    """
+    e = len(convexity_ids)
+    onehot = np.zeros((e, 3), dtype=np.float32)
+    onehot[np.arange(e), np.clip(convexity_ids, 0, 2)] = 1.0
+    cosv = np.asarray(cos_angles, dtype=np.float32).reshape(-1, 1)
+    return np.concatenate([onehot, cosv], axis=1)
+
+
 def make_undirected(edge_index, edge_attr):
     """Duplicate edges in both directions for message passing."""
     ei = np.concatenate([edge_index, edge_index[::-1]], axis=1)
@@ -351,6 +403,162 @@ class MFCADPPGraphDataset(_H5PickleMixin, Dataset):
         return self._read_sample(self.ids[idx])
 
 
+# ----------------------------------------------------------------------------
+# (a') Regenerated MFCAD++ B-rep graphs (hierarchical_graphs_regen/*.h5)
+# ----------------------------------------------------------------------------
+class MFCADPPRegenGraphDataset(_H5PickleMixin, Dataset):
+    """
+    Reads the REGENERATED MFCAD++ splits (diag/regen_dataset.py output), which mirror
+    the released batched-hierarchical B-rep schema so this is a drop-in sibling of
+    MFCADPPGraphDataset, with two correctness upgrades baked into the files:
+
+      * A_1_values  : true per-edge dihedral angle in radians (released = const 1.0)
+      * V_1 cols 5-8: exact per-face unit normal (nx,ny,nz) + plane-d (replaces the
+                      old, unreliable V_2 mesh-pooling path entirely)
+
+    Edge construction + dedup (built before any edge feature construction):
+      One B-rep face pair can meet along several topological edges, so A_1 can hold
+      several rows for the same pair, occasionally spanning >1 convexity bucket. Each
+      pair is collapsed to ONE undirected graph edge with:
+        - convexity by CONCAVE-FIRST precedence (concave > convex > smooth): the
+          concave dihedral is the signal that separates rectangular- from
+          slanted-step faces, so we keep the concave edge whenever one exists,
+          regardless of angle magnitude (NOT an angle tiebreak). Full-scale audit
+          (diag/dup_edge_scan.py + dup_edge_attribute.py): 39 differing-convexity
+          pairs in 37/59,665 models, and in every one the convex/concave edges share
+          the same angle, so "smaller angle" and "concave" never disagree here; the
+          rule is still the unambiguous concave-first one.
+        - angle = median of that pair's per-edge dihedral angles. Median (not mean)
+          is robust to the ~2,274 same-bucket multi-edge pairs whose per-edge angles
+          genuinely vary (curved faces meeting along several arcs, spread up to
+          ~148 deg); for every differing-convexity pair the angles tie so the median
+          equals the concave edge's angle. Stored as cos(angle).
+    """
+    def __init__(self, data_root, h5_dir, split_file, num_surface_types,
+                 angle_reduce="median"):
+        super().__init__()
+        self.data_root = data_root
+        self.num_surface_types = num_surface_types
+        self.angle_reduce = angle_reduce
+        split_path = os.path.join(data_root, split_file)
+        h5_name = SPLIT_H5.get(split_file)
+        if h5_name is None:
+            raise ValueError(f"unknown split file: {split_file}")
+        self.h5_path = os.path.join(data_root, h5_dir, h5_name)
+        _check_data_root(data_root, split_path, self.h5_path)
+
+        with open(split_path) as f:
+            requested = [line.strip() for line in f if line.strip()]
+        self._index = self._build_index()
+        self.ids = [pid for pid in requested if pid in self._index]
+        missing = len(requested) - len(self.ids)
+        if missing:
+            print(f"warning: {missing} ids in {split_file} not found in {h5_name}")
+        self._h5 = None
+
+    def _build_index(self):
+        index = {}
+        with h5py.File(self.h5_path, "r") as f:
+            for batch_key in f.keys():
+                batch = f[batch_key]
+                for i, raw_id in enumerate(batch["CAD_model"][()]):
+                    pid = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+                    index[pid] = (batch_key, i)
+        return index
+
+    def _ensure_open(self):
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5_path, "r")
+            self._batch_cache = {}
+
+    def _batch_arrays(self, batch_key):
+        cached = self._batch_cache.get(batch_key)
+        if cached is None:
+            batch = self._h5[batch_key]
+            cached = {
+                "idx": batch["idx"][()],
+                "A_1_idx": batch["A_1_idx"][()],
+                "A_1_values": batch["A_1_values"][()],
+                "E_1_idx": batch["E_1_idx"][()],
+                "E_2_idx": batch["E_2_idx"][()],
+                "E_3_idx": batch["E_3_idx"][()],
+            }
+            self._batch_cache[batch_key] = cached
+        return cached
+
+    def len(self):
+        return len(self.ids)
+
+    def _read_sample(self, part_id):
+        self._ensure_open()
+        batch_key, model_idx = self._index[part_id]
+        batch = self._h5[batch_key]
+        arrs = self._batch_arrays(batch_key)
+        idx_arr = arrs["idx"]
+        v1_len = batch["V_1"].shape[0]
+        start, end = _brep_bounds(idx_arr, model_idx, v1_len)
+        v1 = np.asarray(batch["V_1"][start:end], dtype=np.float32)  # slice in HDF5
+        x = build_node_features_regen(v1, self.num_surface_types)
+
+        # convexity buckets as canonical, self-loop-free sets
+        e1 = {_canonical_edge(u, v) for u, v in _edge_set(arrs["E_1_idx"], start, end)
+              if u != v}
+        e2 = {_canonical_edge(u, v) for u, v in _edge_set(arrs["E_2_idx"], start, end)
+              if u != v}
+        e3 = {_canonical_edge(u, v) for u, v in _edge_set(arrs["E_3_idx"], start, end)
+              if u != v}
+
+        # group A_1 rows (both directions) by canonical pair -> list of angles (rad)
+        a1 = arrs["A_1_idx"]
+        av = arrs["A_1_values"]
+        mask = ((a1[:, 0] >= start) & (a1[:, 0] < end) &
+                (a1[:, 1] >= start) & (a1[:, 1] < end))
+        rows = a1[mask] - start
+        vals = av[mask]
+        ang_by_pair = {}
+        for (u, v), ang in zip(rows.tolist(), vals.tolist()):
+            if u == v:
+                continue
+            key = _canonical_edge(u, v)
+            ang_by_pair.setdefault(key, []).append(float(ang))
+
+        reduce_fn = np.mean if self.angle_reduce == "mean" else np.median
+        pairs, convexity, cos_ang = [], [], []
+        for key, angs in ang_by_pair.items():
+            if key in e2:          # concave-first precedence (keep the concave edge)
+                cid = 0
+            elif key in e1:
+                cid = 1
+            elif key in e3:
+                cid = 2
+            else:
+                cid = 1            # no bucket (unexpected): default convex
+            pairs.append(key)
+            convexity.append(cid)
+            cos_ang.append(np.cos(float(reduce_fn(angs))))
+
+        if pairs:
+            edge_index = np.asarray(pairs, dtype=np.int64).T
+            ea = build_edge_features_regen(
+                np.asarray(convexity, dtype=np.int64),
+                np.asarray(cos_ang, dtype=np.float32))
+            edge_index, ea = make_undirected(edge_index, ea)
+        else:
+            edge_index = np.zeros((2, 0), dtype=np.int64)
+            ea = np.zeros((0, 4), dtype=np.float32)
+
+        y = np.asarray(batch["labels"][start:end], dtype=np.int64)
+        return Data(
+            x=torch.from_numpy(x),
+            edge_index=torch.from_numpy(edge_index).long(),
+            edge_attr=torch.from_numpy(ea),
+            y=torch.from_numpy(y),
+        )
+
+    def get(self, idx):
+        return self._read_sample(self.ids[idx])
+
+
 def _check_data_root(data_root, split_path, h5_path):
     if not os.path.isdir(data_root):
         raise FileNotFoundError(
@@ -450,7 +658,13 @@ class StepGraphDataset(Dataset):
 
 def get_dataset(cfg, split_file):
     if cfg["loader"] == "h5":
-        if cfg.get("h5_format", "mfcadpp") == "mfcadpp":
+        fmt = cfg.get("h5_format", "mfcadpp")
+        if fmt == "mfcadpp_regen":
+            return MFCADPPRegenGraphDataset(
+                cfg["data_root"], cfg.get("h5_dir", "hierarchical_graphs_regen"),
+                split_file, cfg["num_surface_types"],
+                angle_reduce=cfg.get("angle_reduce", "median"))
+        if fmt == "mfcadpp":
             return MFCADPPGraphDataset(
                 cfg["data_root"], cfg.get("h5_dir", "hierarchical_graphs"),
                 split_file, cfg["num_surface_types"])
