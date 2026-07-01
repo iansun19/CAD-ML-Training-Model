@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MFCAD++ Dataset Explorer</title>
+  <link rel="stylesheet" href="/static/explorer.css">
+</head>
+<body>
+  <header class="app-header">
+    <h1>MFCAD++ Dataset Explorer</h1>
+    <p class="subtitle">Browse 25 machining-feature classes · test set · face-colored 3D geometry</p>
+  </header>
+
+  <main class="layout">
+    <aside class="panel sidebar" id="class-sidebar">
+      <h2>Classes</h2>
+      <div class="class-list" id="class-list">
+        <p class="loading">Loading classes…</p>
+      </div>
+    </aside>
+
+    <section class="panel gallery" id="part-gallery">
+      <div class="gallery-header">
+        <h2 id="gallery-title">Select a class</h2>
+        <p id="gallery-subtitle" class="muted"></p>
+      </div>
+      <div class="part-grid" id="part-grid">
+        <p class="placeholder muted">Choose a class from the sidebar to see example parts.</p>
+      </div>
+      <button type="button" class="btn hidden" id="load-more-btn">Load more</button>
+    </section>
+
+    <section class="panel viewer" id="viewer-panel">
+      <div class="viewer-header">
+        <h2 id="viewer-title">3D Viewer</h2>
+        <div class="viewer-actions">
+          <button type="button" class="btn btn-secondary hidden" id="focus-class-btn">
+            Focus on selected class
+          </button>
+          <button type="button" class="btn btn-secondary hidden" id="reset-view-btn">
+            Reset view
+          </button>
+        </div>
+      </div>
+      <div class="viewer-wrap">
+        <div id="viewer-canvas"></div>
+        <div class="viewer-overlay hidden" id="viewer-loading">
+          <div class="spinner"></div>
+          <p>Loading geometry…</p>
+        </div>
+        <div class="face-tooltip hidden" id="face-tooltip"></div>
+        <div class="part-info hidden" id="part-info"></div>
+      </div>
+      <p class="viewer-hint muted">
+        Drag to rotate · scroll to zoom · right-drag to pan · click a face to isolate its class
+      </p>
+    </section>
+  </main>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="/static/explorer.js"></script>
+</body>
+</html>

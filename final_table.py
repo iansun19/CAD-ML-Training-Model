@@ -31,6 +31,7 @@ LLM_RUNS = [
     ("LLM bounded, stripped (fair ceiling)",   "bounded_stripped"),
     ("LLM bounded, unstripped (+leak)",        "bounded_unstripped"),
     ("LLM features (serialized GNN geom)",      "features_run"),
+    ("LLM features + 25-class templates",       "templates_run"),
 ]
 
 

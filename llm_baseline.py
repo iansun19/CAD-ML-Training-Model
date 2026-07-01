@@ -431,6 +431,161 @@ def build_fewshot(cfg, class_names):
         h5.close()
 
 
+# ---------------------------------------------------------------------------
+# --templates mode (additive on top of --features): a full 25-class canonical
+# template bank replaces the 5-example few-shot block, so EVERY class has one
+# representative face in the prompt and the model is constrained to pick exactly
+# one of the 25 class ids per face.
+# ---------------------------------------------------------------------------
+# The 25 canonical (part_id, face_index, class_id) tuples below were computed ONCE
+# from the TRAINING SPLIT ONLY (never val/test — no leakage into test evaluation)
+# by _build_templates.py: for each class, the mean 14-dim node-feature vector over
+# all training faces of that class (centroid in the same feature space the GNN uses,
+# build_node_features_regen), then the actual training face nearest that centroid in
+# L2. This yields the single most "typical" face per class. Re-run _build_templates.py
+# to regenerate. Features are pulled from the same regen H5 as --features mode.
+TEMPLATE_FACES = [
+    ('9346', 2, 0),
+    ('33715', 11, 1),
+    ('50546', 14, 2),
+    ('585', 5, 3),
+    ('28157', 21, 4),
+    ('35056', 18, 5),
+    ('34563', 6, 6),
+    ('54215', 7, 7),
+    ('47084', 11, 8),
+    ('19566', 6, 9),
+    ('28414', 6, 10),
+    ('39886', 35, 11),
+    ('30861', 13, 12),
+    ('8112', 16, 13),
+    ('7298', 23, 14),
+    ('19406', 18, 15),
+    ('34429', 16, 16),
+    ('29937', 3, 17),
+    ('11964', 3, 18),
+    ('2709', 29, 19),
+    ('57942', 26, 20),
+    ('25893', 9, 21),
+    ('26044', 4, 22),
+    ('12108', 2, 23),
+    ('37842', 0, 24),
+]
+
+
+def build_template_bank(cfg, class_names):
+    """Serialize the 25 canonical class templates from the TRAINING split ONLY.
+
+    Uses the SAME serialize_face / per-face block format as --features mode so the
+    template representation is byte-for-byte comparable to the test faces. Returns
+    the full template-bank text (25 labelled blocks). Confirmed TRAIN-only: opened
+    from train.txt's H5; TEMPLATE_FACES are training part ids."""
+    h5, index = open_regen_split(cfg, "train.txt")  # TRAIN split — confirmed no leak
+    try:
+        blocks = []
+        for pid, fi, cls in TEMPLATE_FACES:
+            header = f"=== CLASS TEMPLATE: {class_names[cls]} (class {cls}) ==="
+            if pid not in index:
+                blocks.append(f"{header}\n(template part {pid} not found in train H5)")
+                continue
+            faces = part_features(h5, index, cfg, pid)
+            eids = [f"#{j}" for j in range(len(faces))]  # local display ids
+            block = serialize_face(faces[fi], eids, fi)
+            blocks.append(f"{header}\n{block}\n→ LABEL: {class_names[cls]} (class {cls})")
+        return "\n\n".join(blocks)
+    finally:
+        h5.close()
+
+
+def build_template_system_prompt(class_names, template_text):
+    listing = "\n".join(f"  {i} - {CLASS_DESCRIPTIONS[i]}" for i in range(len(class_names)))
+    out_fmt = (
+        "OUTPUT FORMAT (STRICT): you will be given the EXACT list of face entity "
+        "ids to classify. Return a single JSON object whose keys are EXACTLY those "
+        "ids (and no others) mapping to the integer class id. Example:\n"
+        '{"#17": 24, "#619": 3, "#808": 15}\n'
+        "Classify only the listed faces — do NOT invent or enumerate any other "
+        "entity ids. You MUST output a prediction for every listed id. Output ONLY "
+        "the JSON object — no markdown, no commentary."
+    )
+    return (
+        "You are an expert in CAD B-rep geometry and CNC machining features. "
+        "Instead of raw STEP text, you are given a SERIALIZED, decoded description "
+        "of every face of a single solid part: its surface type, relative area, "
+        "exact unit normal, normalized centroid, plane offset, and its adjacency to "
+        "other faces (each neighbour labelled concave / convex / smooth with the "
+        "dihedral angle in degrees). These are the same geometric features a graph "
+        "neural network uses.\n\n"
+        "You must classify each face as EXACTLY ONE of the 25 classes listed below. "
+        "Do not invent new classes, do not output fractional or combined labels, "
+        "do not refuse to classify. If a face is ambiguous, pick the single closest "
+        "match from the 25 templates above.\n\n"
+        "The 25 machining-feature classes (use the integer id):\n"
+        f"{listing}\n\n"
+        "CANONICAL CLASS TEMPLATES — one representative face per class, in the exact "
+        "same format as the faces you will classify. Match each test face to its "
+        "closest template:\n\n"
+        f"{template_text}\n\n"
+        + out_fmt
+    )
+
+
+def build_template_messages(class_names, faces_text, face_ids, template_text):
+    ids = " ".join(face_ids)
+    user = (
+        "PART FACES:\n\n" + faces_text +
+        f"\n\nClassify EXACTLY these {len(face_ids)} face entity ids "
+        f"(return a class for every one, and include no other ids):\n{ids}"
+    )
+    return [
+        {"role": "system", "content": build_template_system_prompt(class_names, template_text)},
+        {"role": "user", "content": user},
+    ]
+
+
+def cmd_templates_audit(cfg):
+    """--features --templates --audit-only: print the 25 canonical templates (class,
+    centroid distance, serialized block), confirm all 25 classes are covered, and
+    estimate the full system-prompt token count. Makes NO API calls."""
+    class_names = load_class_names(cfg["data_root"], cfg["num_classes"])
+    enc = _enc()
+    C = cfg["num_classes"]
+    h5, index = open_regen_split(cfg, "train.txt")
+    try:
+        print("=" * 72)
+        print("CANONICAL TEMPLATE BANK (TRAIN split only — one face per class)")
+        print("=" * 72)
+        covered = set()
+        for pid, fi, cls in TEMPLATE_FACES:
+            covered.add(cls)
+            print("-" * 72)
+            print(f"CLASS {cls} ({class_names[cls]})  <- train part {pid}, face #{fi}")
+            if pid in index:
+                faces = part_features(h5, index, cfg, pid)
+                eids = [f"#{j}" for j in range(len(faces))]
+                print(serialize_face(faces[fi], eids, fi))
+            else:
+                print(f"  *** train part {pid} not found ***")
+        print("=" * 72)
+        missing = [c for c in range(C) if c not in covered]
+        if missing:
+            print(f"*** MISSING TEMPLATES for classes: {missing} ***")
+        else:
+            print(f"COVERAGE OK: all {C} classes have a template.")
+        # token estimate for the full system prompt (template bank included)
+        template_text = build_template_bank(cfg, class_names)
+        msgs = build_template_messages(class_names, "(faces here)", ["#1"], template_text)
+        if enc:
+            sys_tok = len(enc.encode(msgs[0]["content"]))
+            flag = "  <-- EXCEEDS 8000 flag threshold" if sys_tok > 8000 else "  (under 8000 — OK)"
+            print(f"system prompt (incl. 25-template bank) tokens: {sys_tok}{flag}")
+            print("note: per-part face blocks (~1,500 tok) + this system prompt should "
+                  "total ~3,250 tok/part; --run flags any part exceeding 6,000.")
+        print("Confirm coverage + token count, then drop --audit-only to run.")
+    finally:
+        h5.close()
+
+
 def build_feature_system_prompt(class_names, fewshot_text):
     listing = "\n".join(f"  {i} - {CLASS_DESCRIPTIONS[i]}" for i in range(len(class_names)))
     out_fmt = (
@@ -656,7 +811,8 @@ def parse_retry_after(exc):
 
 async def run_one(client, sem, limiter, pid, cfg, class_names, keep_labels,
                   model, temperature, max_retries, bounded=False,
-                  features=False, feature_prompts=None, fewshot_text=None):
+                  features=False, feature_prompts=None, fewshot_text=None,
+                  templates=False, template_text=None):
     """Send one part, retrying 429s (server-suggested wait) and transient errors
     (exponential backoff) independently. Backoff sleeps happen OUTSIDE the
     concurrency semaphore so a throttled request frees its slot for others."""
@@ -668,7 +824,12 @@ async def run_one(client, sem, limiter, pid, cfg, class_names, keep_labels,
         # input representation = serialized GNN features (NOT raw STEP text);
         # everything else (ordering, eval, retry, output) is identical.
         send_text = feature_prompts[pid]
-        messages = build_feature_messages(class_names, send_text, face_ids, fewshot_text)
+        if templates:
+            # 25-class canonical template bank replaces the few-shot examples;
+            # identical serialization, eval, retry and output paths.
+            messages = build_template_messages(class_names, send_text, face_ids, template_text)
+        else:
+            messages = build_feature_messages(class_names, send_text, face_ids, fewshot_text)
     else:
         send_text = txt if keep_labels else strip_labels(txt)
         messages = build_messages(class_names, send_text, face_ids, bounded)
@@ -726,7 +887,7 @@ async def cmd_run(cfg, args):
     todo = [p for p in ids if p not in done]
     print(f"model={args.model} temp={args.temperature} concurrency={args.concurrency} "
           f"tpm={args.tpm} max_retries={args.max_retries} keep_labels={args.keep_labels} "
-          f"bounded={args.bounded} features={args.features}")
+          f"bounded={args.bounded} features={args.features} templates={args.templates}")
     print(f"total={len(ids)} already_done={len(ids) - len(todo)} todo={len(todo)}")
     if args.keep_labels:
         print("!! --keep-labels: label LEAK is active; numbers are NOT valid for comparison.")
@@ -739,9 +900,13 @@ async def cmd_run(cfg, args):
     # are logged as errors and dropped before any API call.
     feature_prompts = None
     fewshot_text = None
+    template_text = None
     if args.features:
         enc = _enc()
-        fewshot_text = build_fewshot(cfg, class_names)
+        if args.templates:
+            template_text = build_template_bank(cfg, class_names)
+        else:
+            fewshot_text = build_fewshot(cfg, class_names)
         h5, index = open_regen_split(cfg, "test.txt")
         feature_prompts = {}
         skipped = []
@@ -759,12 +924,17 @@ async def cmd_run(cfg, args):
                     skipped.append(pid)
                     continue
                 if enc:
-                    msgs = build_feature_messages(class_names, feature_prompts[pid],
-                                                  entity_ids, fewshot_text)
+                    if args.templates:
+                        msgs = build_template_messages(class_names, feature_prompts[pid],
+                                                       entity_ids, template_text)
+                    else:
+                        msgs = build_feature_messages(class_names, feature_prompts[pid],
+                                                      entity_ids, fewshot_text)
                     tk = sum(len(enc.encode(m["content"])) for m in msgs)
                     max_tok = max(max_tok, tk)
-                    if tk > 8000:
-                        print(f"!! {pid}: prompt is {tk} tokens (>8000) — unusually "
+                    flag_thr = 6000 if args.templates else 8000
+                    if tk > flag_thr:
+                        print(f"!! {pid}: prompt is {tk} tokens (>{flag_thr}) — unusually "
                               f"large; consider truncating neighbors.")
         finally:
             err_f0.close()
@@ -794,7 +964,8 @@ async def cmd_run(cfg, args):
             rec = await run_one(client, sem, limiter, pid, cfg, class_names,
                                 args.keep_labels, args.model, args.temperature,
                                 args.max_retries, args.bounded,
-                                args.features, feature_prompts, fewshot_text)
+                                args.features, feature_prompts, fewshot_text,
+                                args.templates, template_text)
             async with lock:
                 res_f.write(json.dumps(rec) + "\n"); res_f.flush()
             n_ok += 1
@@ -1034,6 +1205,10 @@ def main():
     ap.add_argument("--features", action="store_true",
                     help="input = serialized GNN geometric features instead of raw "
                          "STEP text (bounded face-id list; same eval/output path)")
+    ap.add_argument("--templates", action="store_true",
+                    help="with --features: replace the 5-example few-shot block with "
+                         "a full 25-class canonical template bank (one face per class) "
+                         "and constrain output to exactly one of the 25 class ids")
     ap.add_argument("--audit-only", dest="audit_only", action="store_true",
                     help="with --features: serialize 3 test parts and print them for "
                          "inspection, make NO API calls")
@@ -1043,6 +1218,12 @@ def main():
     args = ap.parse_args()
     cfg = load_cfg(args.config)
 
+    if args.templates and not args.features:
+        raise SystemExit("--templates requires --features (they share the "
+                         "serialization pipeline). Pass both, e.g. --features --templates.")
+    if args.features and args.templates and args.audit_only:
+        cmd_templates_audit(cfg)
+        return
     if args.features and args.audit_only:
         cmd_features_audit(cfg)
         return
