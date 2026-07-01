@@ -106,7 +106,8 @@ def load_cfg(path="config.yaml"):
 
 
 def step_path(cfg, part_id):
-    return os.path.join(cfg["data_root"], "step", "test", f"{part_id}.step")
+    step_dir = cfg.get("step_dir", "step_12class")
+    return os.path.join(cfg["data_root"], step_dir, "test", f"{part_id}.step")
 
 
 def read_test_ids(cfg):
