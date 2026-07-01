@@ -20,6 +20,11 @@ data/
 MFCAD_dataset/
 MFCAD++_dataset/
 
+# NIST CTC-01 transfer-test outputs (authoritative jsonl + intermediates; do NOT commit)
+nist_ctc_01_predictions.jsonl
+nist_ctc_01_stage_a.npz
+# (nist_ctc_01_annotated.step and nist_ctc_01.step already covered by *.step)
+
 # OS / editor
 .DS_Store
 .idea/
